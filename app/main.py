@@ -45,7 +45,13 @@ the molecule heavy count is a birth-death chain; given closed-interval
 observations of that count at distinct steps it returns their exact joint
 probability and, conditioned on all of them, the exact heavy-count
 distribution at every step, again exactly over Q and never enumerating
-exchange sequences.
+exchange sequences. An eleventh endpoint counts heavy-isotope losses in
+the same finite-bath exchange: every swap that moves a heavy isotope out
+of the molecule (a down transition) adds one to the loss count while
+same-type swaps and up transitions add nothing, and it returns the exact
+joint probability of the observations together with the exact conditional
+distribution of the total loss count over the whole trajectory, tracked
+as an extra dimension of the same integer-weight forward recursion.
 """
 
 from __future__ import annotations
@@ -524,6 +530,23 @@ class ExchangeTrajectoryResponse(BaseModel):
     # given all observations; non-zero entries ascending by heavy_count.
     # Omitted when the observations have joint probability zero.
     distributions: Optional[List[List[HeavyCountPeak]]] = None
+
+
+class ExchangeTurnoverRequest(ExchangeTrajectoryRequest):
+    """Identical fields and strict validation to the trajectory request."""
+
+
+class TurnoverCountPeak(BaseModel):
+    count: int
+    probability: str  # reduced fraction "n/d"
+
+
+class ExchangeTurnoverResponse(BaseModel):
+    probability: str  # reduced fraction "n/d"
+    # Conditional law of the total loss count over steps 0..steps given all
+    # observations; non-zero entries ascending by count. Omitted when the
+    # observations have joint probability zero.
+    distribution: Optional[List[TurnoverCountPeak]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1520,7 +1543,98 @@ def exchange_trajectory(
     return probability, distributions
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.9.0")
+def exchange_turnover(
+    n: int,
+    m: int,
+    h: int,
+    b: int,
+    steps: int,
+    observations: List[Tuple[int, int, int]],
+) -> Tuple[Fraction, Optional[Dict[int, Fraction]]]:
+    """Exact finite-bath exchange loss-count (turnover) inference, over Q.
+
+    The exchange dynamics are exactly those of ``exchange_trajectory``:
+    each step picks one of the ``n*m`` (molecule site, bath site) pairs
+    uniformly and swaps (same-type swaps count as steps), so the molecule
+    heavy count X_t is a birth-death chain with integer transition
+    numerators up/down/stay over the common denominator ``n*m``. The loss
+    count C_t additionally increments by 1 on every down transition (a
+    heavy isotope leaves the molecule); same-type swaps and up
+    transitions leave it unchanged, and repeated outflows accumulate one
+    by one. ``observations`` lists ``(step, lower, upper)`` constraints
+    on X_t at distinct steps (step 0 is the initial state X_0 = h).
+    Returns the exact joint probability of all observations and, when it
+    is non-zero, the exact conditional distribution of the total loss
+    count C_steps given all of them as a count -> probability mapping; a
+    zero joint probability yields ``(0, None)``.
+
+    The forward recursion carries exact integer weights keyed by the
+    joint state (heavy count, loss count): A_t[(x, c)] with
+    alpha_t(x, c) = A_t[(x, c)] / (n*m)**t, zeroing every state that
+    violates the observation at its step. Paths that end at the same
+    heavy count but accumulated different loss counts (round trips such
+    as 1 -> 0 -> 1 or 1 -> 2 -> 1 versus staying at 1) occupy distinct
+    cells and are merged only when the loss-count marginal is read off,
+    so every outflow is counted separately as required. The remaining
+    mass at step ``steps`` gives the joint probability
+    ``z / (n*m)**steps`` and each conditional loss probability is the
+    single Fraction reduction ``weight_c / z``. No exchange sequence is
+    ever enumerated.
+    """
+    total = h + b  # conserved heavy-isotope count (molecule + bath)
+    denom = n * m  # every one-step transition has this denominator
+
+    # Integer transition numerators at molecule heavy count x.
+    ups = [(n - x) * (total - x) for x in range(n + 1)]
+    downs = [x * (m - total + x) for x in range(n + 1)]
+    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
+
+    filters = {step: (lower, upper) for step, lower, upper in observations}
+
+    # Forward pass over exact integer weights keyed by (heavy count, loss
+    # count): alpha_t(x, c) = current[(x, c)] / denom**t, with states
+    # violating an observation zeroed at its step.
+    current: Dict[Tuple[int, int], int] = {(h, 0): 1}
+    if 0 in filters:
+        lower, upper = filters[0]
+        if not lower <= h <= upper:
+            current = {}
+    for t in range(1, steps + 1):
+        nxt: Dict[Tuple[int, int], int] = {}
+        for (x, c), weight in current.items():
+            if stays[x]:
+                key = (x, c)
+                nxt[key] = nxt.get(key, 0) + weight * stays[x]
+            if ups[x]:
+                key = (x + 1, c)
+                nxt[key] = nxt.get(key, 0) + weight * ups[x]
+            if downs[x]:
+                key = (x - 1, c + 1)
+                nxt[key] = nxt.get(key, 0) + weight * downs[x]
+        if t in filters:
+            lower, upper = filters[t]
+            nxt = {
+                key: w for key, w in nxt.items() if lower <= key[0] <= upper
+            }
+        current = nxt
+
+    z_num = sum(current.values())
+    if z_num == 0:
+        return Fraction(0), None
+    probability = Fraction(z_num, denom**steps)
+
+    # Marginalize the heavy count: each loss count's conditional weight is
+    # reduced exactly once against the surviving total mass.
+    losses: Dict[int, int] = {}
+    for (_x, c), weight in current.items():
+        losses[c] = losses.get(c, 0) + weight
+    distribution = {
+        c: Fraction(weight, z_num) for c, weight in losses.items() if weight
+    }
+    return probability, distribution
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.10.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1762,6 +1876,36 @@ def compute_exchange_trajectory(
                 for count, prob in sorted(step_dist.items())
             ]
             for step_dist in distributions
+        ],
+    )
+
+
+@app.post(
+    "/v1/exchange-turnover",
+    response_model=ExchangeTurnoverResponse,
+    response_model_exclude_none=True,
+)
+def compute_exchange_turnover(
+    request: ExchangeTurnoverRequest,
+) -> ExchangeTurnoverResponse:
+    observations = [
+        (obs.step, obs.lower, obs.upper) for obs in request.observations
+    ]
+    probability, distribution = exchange_turnover(
+        request.n,
+        request.m,
+        request.h,
+        request.b,
+        request.steps,
+        observations,
+    )
+    if distribution is None:
+        return ExchangeTurnoverResponse(probability=to_fraction_str(probability))
+    return ExchangeTurnoverResponse(
+        probability=to_fraction_str(probability),
+        distribution=[
+            TurnoverCountPeak(count=count, probability=to_fraction_str(prob))
+            for count, prob in sorted(distribution.items())
         ],
     )
 
